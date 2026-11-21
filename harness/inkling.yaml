@@ -12,7 +12,7 @@ model:
   keep_recent_tokens: 10000
   keep_reasoning_last: 1
   model_kwargs:
-    api_base: http://192.168.122.1:8080/v1
+    api_base: http://192.168.122.1/v1
     max_tokens: 10000
     timeout: 1800
     drop_params: true
