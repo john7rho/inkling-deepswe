@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inkling-deepswe-harness"
+version = "0.1.0"
+description = "Context-managing mini-swe-agent model class for small-context local models"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+package-dir = {"" = "harness"}
+py-modules = ["inkling_model"]

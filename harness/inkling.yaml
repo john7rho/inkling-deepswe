@@ -1,0 +1,21 @@
+# mini-swe-agent overrides for Inkling 2 Mini served by llama-server on the host.
+# Applied on top of mini-swe-agent's default mini.yaml (prompts unchanged).
+agent:
+  step_limit: 150
+  cost_limit: 0
+  wall_time_limit_seconds: 6000
+  max_consecutive_format_errors: 5
+model:
+  model_name: openai/inkling-2-mini
+  cost_tracking: ignore_errors
+  compact_at_tokens: 44000
+  keep_recent_tokens: 10000
+  keep_reasoning_last: 1
+  model_kwargs:
+    api_base: http://192.168.122.1:8080/v1
+    max_tokens: 10000
+    timeout: 1800
+    drop_params: true
+    extra_body:
+      chat_template_kwargs:
+        reasoning_effort: minimal
