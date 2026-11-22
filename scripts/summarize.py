@@ -8,6 +8,10 @@ tasks_dir = Path(__file__).resolve().parent.parent.parent / "deep-swe" / "tasks"
 rows = []
 for d in sorted(p for p in job.iterdir() if p.is_dir()):
     name = d.name.rsplit("__", 1)[0]
+    try:  # trial directory names are truncated; the trial config has the full task path
+        name = Path(json.loads((d / "config.json").read_text())["task"]["path"]).name
+    except Exception:
+        pass
     row = {"task": name, "lang": "?", "reward": None, "f2p": "", "p2p": "", "steps": "", "min": "", "exit": "", "compactions": ""}
     try:
         row["lang"] = tomllib.loads((tasks_dir / name / "task.toml").read_text())["metadata"]["language"]

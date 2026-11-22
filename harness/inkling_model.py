@@ -9,12 +9,15 @@ tokens). This class changes only what is sent to the model, never the saved traj
    so the server's prompt cache is reused) to write a handoff note. Older turns are then
    replaced by that note and only the recent turns are kept verbatim.
 3. If the server still rejects a request as too long, history is cut harder and retried.
+4. The model is told its step and time budget up front, reminded that only committed work
+   is graded, and warned as the budget runs out (mini-swe-agent otherwise stops silently).
 
 Use with:  model.model_class: inkling_model.InklingModel
 """
 
 import json
 import logging
+import time
 
 import litellm
 
@@ -47,6 +50,26 @@ commands if you need their current contents.]
 """
 
 
+_BUDGET_INTRO = """
+
+<budget>
+You have at most {steps} steps and about {minutes} minutes for this task. Only changes \
+committed to git are graded: uncommitted work counts as nothing. Create your branch early, \
+commit as soon as something works (`git add -A && git commit -m "..."`), and commit again \
+after each further milestone. A partial solution that is committed beats a complete one \
+that is not.
+</budget>"""
+
+_BUDGET_WARNING = """
+
+[Budget notice: about {steps} steps and {minutes} minutes remain. Commit all your work now \
+(`git add -A && git commit -m "..."`). Then finish only the most important remaining item, \
+commit again, and submit with `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.]"""
+
+_WARN_STEPS_LEFT = (30, 15, 6, 2)
+_WARN_TIME_USED = (0.75, 0.9, 0.97)
+
+
 class InklingModelConfig(LitellmModelConfig):
     compact_at_tokens: int = 44000
     """Compact history when the estimated prompt size exceeds this."""
@@ -54,6 +77,10 @@ class InklingModelConfig(LitellmModelConfig):
     """Approximate size of the recent history kept verbatim after compaction."""
     keep_reasoning_last: int = 1
     """Number of most recent assistant turns whose reasoning text is resent."""
+    budget_steps: int = 0
+    """The agent's step limit, so the model can be told about it (0 = say nothing)."""
+    budget_seconds: int = 0
+    """The agent's wall-time limit, so the model can be told about it (0 = say nothing)."""
     summary_max_tokens: int = 5000
     """Output budget for the handoff note (includes the model's reasoning tokens)."""
 
@@ -66,14 +93,24 @@ class InklingModel(LitellmModel):
         self._tokens_per_char = 0.30
         self._last_view_chars = 0
         self.n_compactions = 0
+        self._n_queries = 0
+        self._t0 = None
+        self._notes: dict[int, str] = {}  # raw message index -> text appended to that message
+        self._time_warned = 0
 
     # ---- view of the history that is actually sent -------------------------------------
 
     def _view(self, messages: list[dict]) -> list[dict]:
-        head = [dict(m) for m in messages[:2]]
+        def noted(i: int) -> dict:
+            m = dict(messages[i])
+            if i in self._notes:
+                m["content"] = _content_text(m) + self._notes[i]
+            return m
+
+        head = [noted(i) for i in range(min(2, len(messages)))]
         if self._cut > 2 and len(head) == 2:
             head[1] = {**head[1], "content": _content_text(head[1]) + "\n\n" + _SUMMARY_HEADER + self._summary}
-        view = head + [dict(m) for m in messages[self._cut :]]
+        view = head + [noted(i) for i in range(self._cut, len(messages))]
         view = [{k: v for k, v in m.items() if k not in _DROP_KEYS and v is not None} for m in view]
         assistant_idx = [i for i, m in enumerate(view) if m.get("role") == "assistant"]
         keep = set(assistant_idx[-self.config.keep_reasoning_last :]) if self.config.keep_reasoning_last > 0 else set()
@@ -140,9 +177,40 @@ class InklingModel(LitellmModel):
         self.n_compactions += 1
         logger.warning("compacted history: cut=%d of %d messages, note=%d chars", new_cut, len(messages), len(self._summary))
 
+    # ---- budget notes -------------------------------------------------------------------
+
+    def _update_budget_notes(self, messages: list[dict]) -> None:
+        cfg = self.config
+        if not (cfg.budget_steps or cfg.budget_seconds):
+            return
+        now = time.time()
+        if self._t0 is None:
+            self._t0 = now
+            if len(messages) > 1:
+                self._notes[1] = _BUDGET_INTRO.format(
+                    steps=cfg.budget_steps or "unlimited", minutes=(cfg.budget_seconds // 60) or "unlimited"
+                )
+        steps_left = cfg.budget_steps - self._n_queries if cfg.budget_steps else None
+        secs_left = cfg.budget_seconds - (now - self._t0) if cfg.budget_seconds else None
+        warn = steps_left in _WARN_STEPS_LEFT
+        if cfg.budget_seconds:
+            used = (now - self._t0) / cfg.budget_seconds
+            crossed = sum(1 for f in _WARN_TIME_USED if used >= f)
+            if crossed > self._time_warned:
+                self._time_warned = crossed
+                warn = True
+        last = len(messages) - 1
+        if warn and last >= 2 and messages[last].get("role") in ("tool", "user"):
+            self._notes[last] = _BUDGET_WARNING.format(
+                steps="?" if steps_left is None else max(0, steps_left),
+                minutes="?" if secs_left is None else max(0, int(secs_left // 60)),
+            )
+
     # ---- query --------------------------------------------------------------------------
 
     def query(self, messages: list[dict], **kwargs) -> dict:
+        self._update_budget_notes(messages)
+        self._n_queries += 1
         if self._estimate_tokens(messages) > self.config.compact_at_tokens:
             self._compact(messages, keep_tokens=self.config.keep_recent_tokens, use_llm=True)
         try:
