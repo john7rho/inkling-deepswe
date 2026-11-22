@@ -11,6 +11,8 @@ tokens). This class changes only what is sent to the model, never the saved traj
 3. If the server still rejects a request as too long, history is cut harder and retried.
 4. The model is told its step and time budget up front, reminded that only committed work
    is graded, and warned as the budget runs out (mini-swe-agent otherwise stops silently).
+5. Near the end of the budget the harness itself runs `git add -A && git commit` as a step
+   (no model call), so work is not lost when the model runs out of time mid-edit.
 
 Use with:  model.model_class: inkling_model.InklingModel
 """
@@ -69,6 +71,16 @@ commit again, and submit with `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.]"""
 _WARN_STEPS_LEFT = (30, 15, 6, 2)
 _WARN_TIME_USED = (0.75, 0.9, 0.97)
 
+# harness-issued checkpoint commits (each uses one step, no model call)
+_COMMIT_STEPS_LEFT = (12, 4, 1)
+_COMMIT_TIME_USED = (0.80, 0.90, 0.96)
+_COMMIT_COMMAND = (
+    'cd /app 2>/dev/null; cd "$(git rev-parse --show-toplevel)" && git add -A && '
+    '(git diff --cached --quiet && echo "nothing new to commit" || '
+    'git -c user.name=agent -c user.email=agent@localhost commit -q -m "checkpoint: work in progress" '
+    '&& echo "checkpoint committed") ; git log --oneline | head -3'
+)
+
 
 class InklingModelConfig(LitellmModelConfig):
     compact_at_tokens: int = 44000
@@ -81,6 +93,8 @@ class InklingModelConfig(LitellmModelConfig):
     """The agent's step limit, so the model can be told about it (0 = say nothing)."""
     budget_seconds: int = 0
     """The agent's wall-time limit, so the model can be told about it (0 = say nothing)."""
+    auto_commit: bool = True
+    """Run a harness-issued `git add -A && git commit` step as the step/time budget runs out."""
     summary_max_tokens: int = 5000
     """Output budget for the handoff note (includes the model's reasoning tokens)."""
 
@@ -93,10 +107,12 @@ class InklingModel(LitellmModel):
         self._tokens_per_char = 0.30
         self._last_view_chars = 0
         self.n_compactions = 0
+        self.n_checkpoints = 0
         self._n_queries = 0
         self._t0 = None
         self._notes: dict[int, str] = {}  # raw message index -> text appended to that message
         self._time_warned = 0
+        self._time_committed = 0
 
     # ---- view of the history that is actually sent -------------------------------------
 
@@ -206,11 +222,49 @@ class InklingModel(LitellmModel):
                 minutes="?" if secs_left is None else max(0, int(secs_left // 60)),
             )
 
+    def _checkpoint_due(self, messages: list[dict]) -> bool:
+        cfg = self.config
+        if not cfg.auto_commit or self._t0 is None or not messages or messages[-1].get("role") != "tool":
+            return False
+        due = bool(cfg.budget_steps) and (cfg.budget_steps - self._n_queries) in _COMMIT_STEPS_LEFT
+        if cfg.budget_seconds:
+            used = (time.time() - self._t0) / cfg.budget_seconds
+            crossed = sum(1 for f in _COMMIT_TIME_USED if used >= f)
+            if crossed > self._time_committed:
+                self._time_committed = crossed
+                due = True
+        return due
+
+    def _checkpoint_message(self) -> dict:
+        call_id = f"checkpoint_{self._n_queries}"
+        return {
+            "role": "assistant",
+            "content": "[Automatic checkpoint by the harness: committing the work so far.]",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": json.dumps({"command": _COMMIT_COMMAND})},
+                }
+            ],
+            "extra": {
+                "actions": [{"command": _COMMIT_COMMAND, "tool_call_id": call_id}],
+                "cost": 0.0,
+                "timestamp": time.time(),
+                "harness_checkpoint": True,
+                "context": {"cut": self._cut, "n_compactions": self.n_compactions, "prompt_tokens": 0},
+            },
+        }
+
     # ---- query --------------------------------------------------------------------------
 
     def query(self, messages: list[dict], **kwargs) -> dict:
         self._update_budget_notes(messages)
+        due = self._checkpoint_due(messages)
         self._n_queries += 1
+        if due:
+            self.n_checkpoints += 1
+            return self._checkpoint_message()
         if self._estimate_tokens(messages) > self.config.compact_at_tokens:
             self._compact(messages, keep_tokens=self.config.keep_recent_tokens, use_llm=True)
         try:
@@ -227,7 +281,7 @@ class InklingModel(LitellmModel):
 
     def serialize(self) -> dict:
         data = super().serialize()
-        data["info"]["context"] = {"cut": self._cut, "n_compactions": self.n_compactions, "summary": self._summary}
+        data["info"]["context"] = {"cut": self._cut, "n_compactions": self.n_compactions, "n_checkpoints": self.n_checkpoints, "summary": self._summary}
         return data
 
 
